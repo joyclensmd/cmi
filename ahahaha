@@ -1,0 +1,2245 @@
+// This file is the entry point for the bot.
+
+const path = require('path')
+const request = require('request-promise')
+const Discord = require('discord.js')
+const { GlobalCache } = require('./GlobalCache')
+const config = require('./data/client.json')
+const updateServer = require('./UpdateServer.js')
+const Util = require('./Util.js')
+
+// Set up the sharding manager, a helper class that separates handling
+// guilds into grouped processes called Shards.
+const shardingManager = new Discord.ShardingManager(path.join(__dirname, 'Shard.js'), {
+  token: config.token,
+  totalShards: config.totalShards || 'auto',
+  shardArgs: typeof v8debug === 'object' ? ['--inspect'] : undefined,
+  execArgv: ['--trace-warnings']
+})
+
+shardingManager.on('shardCreate', shard => {
+  console.log(`Launching shard ${shard.id + 1}/${shardingManager.totalShards}`)
+})
+
+shardingManager.spawn(config.totalShards || 'auto', 8000, -1)
+
+// Instantiate a GlobalCache, which will cache information from the shards.
+global.GlobalCache = new GlobalCache(shardingManager)
+
+// Set bot status messages
+let currentActivity = 0
+let totalUsers = null
+
+async function getNextActivity () {
+  currentActivity++
+  if (currentActivity === 2 && totalUsers == null) currentActivity++
+
+  if (currentActivity > 3) {
+    currentActivity = 0
+  }
+
+  switch (currentActivity) {
+    case 0:
+      return { text: 'https://RoVer.link' }
+    case 1: {
+      let totalGuilds = (await shardingManager.fetchClientValues('guilds.cache.size')).reduce((prev, val) => prev + val, 0)
+      totalGuilds = Util.toHumanReadableNumber(totalGuilds)
+      return { text: `${totalGuilds} servers`, type: 'WATCHING' }
+    } case 2:
+      return { text: `${totalUsers} users`, type: 'LISTENING' }
+    case 3:
+      return { text: '!rover', type: 'LISTENING' }
+  }
+}
+
+request('https://verify.eryn.io/api/count')
+  .then(count => {
+    totalUsers = Util.toHumanReadableNumber(count)
+  })
+
+/*setInterval(async () => {
+  if (shardingManager.shards.size === shardingManager.totalShards) {
+    shardingManager.broadcast({
+      action: 'status',
+      argument: await getNextActivity()
+    })
+  }
+}, 15000)*/
+
+// If updateServer is defined, start that up as well.
+if (config.updateServer) {
+  updateServer(shardingManager, config.updateServer)
+}
+
+if (config.mainLifeTime) {
+  setTimeout(() => {
+    shardingManager.respawn = false
+    shardingManager.broadcastEval('process.exit()')
+  }, config.mainLifeTime * 1000)
+
+  setTimeout(() => {
+    process.exit()
+  }, (config.mainLifeTime + 5) * 1000)
+}
+
+// Client.json documentation:
+/*
+    "token"             : String. The bot token that is used to log in to your bot.
+    "lockNicknames"     : Boolean. Default false. If true, the bot will run DiscordServer.verifyMember every time
+                          they begin typing. This will quickly eat up API requests if you aren't careful. Mostly
+                          used on the hosted version.
+    "updateServer"      : {
+                          If this object is present, the update server will be started.
+
+        "port"          : Integer. The port the Update server runs on.
+        "apiKey"        : String. The API key the server checks against before updating the user.
+    }
+    "loud"              : Boolean. Default false. Logs every request made to stdout.
+    "totalShards"       : Integer. Default auto. The number of shards to launch.
+    "apiRequestMethod"  : String. Default 'sequential'. sequential' or 'burst'. Sequential executes all requests in the order
+                          they are triggered, whereas burst runs multiple at a time, and doesn't guarantee a particular order.
+    "owner"             : String. Default "0". The Discord ID of the bot's owner.
+    "commandPrefix"     : String. Default "!". The prefix for commands.
+    "shardLifeTime"     : Integer. Number of seconds each shard will run before closing.
+    "mainLifeTime"      : Integer. Number of seconds the main process will run before closing.
+    "cookie"            : String. The .ROBLOSECURITY cookie of the bot account used to fetch premium information of a user.
+                          (Not required if you're not using the premium virtualgroup, but whois will not report premium information correctly)
+    "invite"            : String. The bot invite link.
+    "disableAutoUpdate" : Boolean. Disables auto update feature.
+*/
+
+/* eslint-disable */
+// A file for testing requests through fiddler. Add `require('./proxy')()` to the top of index.js to enable this
+const url = require("url"),
+    http = require("http"),
+
+    env = process.env,
+
+    proxy = {
+        protocol: "http:",
+        hostname: "127.0.0.1",
+        port: 8888,
+    },
+
+    proxyRequests = function () {
+        var proxyUrl = url.format(proxy);
+        env.http_proxy = proxyUrl;
+        env.https_proxy = proxyUrl;
+        env.NODE_TLS_REJECT_UNAUTHORIZED = 0;
+    },
+
+    unproxyRequests = function () {
+        env.http_proxy = "";
+        env.https_proxy = "";
+        env.NODE_TLS_REJECT_UNAUTHORIZED = "";
+    }
+
+module.exports = proxyRequests
+
+// This file is the entry point for Shard processes.
+
+const config = require('./data/client.json')
+const DiscordBot = require('./DiscordBot')
+
+// Instantiate the bot.
+const discordBot = new DiscordBot()
+
+// Listen for when we need to globally update a member
+// from the Update Server.
+process.on('message', msg => {
+  if (msg.action === 'globallyUpdateMember') {
+    discordBot.globallyUpdateMember(msg.argument)
+  } else if (msg.action === 'status') {
+    discordBot.setActivity(msg.argument.text, msg.argument.type)
+  }
+})
+
+// Max shard life time
+if (config.shardLifeTime) {
+  setTimeout(() => {
+    process.exit()
+  }, config.shardLifeTime * 1000)
+}
+
+const express = require('express')
+
+module.exports =
+// This function starts the update server. This is used
+// to cause the bot to download new information about a
+// target user and update the user's state in all servers.
+function (shardingManager, config) {
+  const server = express()
+
+  server.get('/update-user', (req, res) => {
+    if (config.apiKey && config.apiKey !== req.query.apiKey) {
+      return res.status(403).end()
+    }
+
+    if (req.query.id == null || req.query.guilds == null) {
+      return res.status(400).end()
+    }
+
+    const id = req.query.id
+    const guilds = req.query.guilds.split(',')
+
+    res.end('ok')
+
+    shardingManager.broadcast({
+      action: 'globallyUpdateMember',
+      argument: { id, guilds }
+    })
+  })
+
+  server.listen(config.port, () => {
+    console.log(`Update server listening on http://localhost:${config.port}/`)
+  })
+}
+
+const crypto = require('crypto')
+
+/**
+ * @module Util
+ */
+module.exports = {
+  /**
+   * Performs string formatting for things like custom nicknames.
+   *
+   * @param {string} formatString The string to format (contains replacement strings)
+   * @param {object} data The data to replace the string replacements with
+   * @param {GuildMember} member The guild member this string is being formatted for
+   * @returns {string} The processed string
+   */
+  formatDataString (formatString, data, member) {
+    const replacements = {
+      '%USERNAME%': data.robloxUsername,
+      '%USERID%': data.robloxId,
+      '%RANK%': data.groupRank || '',
+      '%DISCORDNAME%': data.discordName || '',
+      '%DISCORDID%': data.discordId || ''
+    }
+
+    if (member != null) {
+      replacements['%DISCORDNAME%'] = member.user.username
+      replacements['%DISCORDID%'] = member.id
+      replacements['%SERVER%'] = member.guild.name
+    }
+
+    return formatString.replace(/%\w+%/g, (all) => {
+      return typeof replacements[all] !== 'undefined' ? replacements[all] : all
+    })
+  },
+
+  /**
+   * Returns a promise that resolves after the given time in milliseconds.
+   * @param {int} sleepTime The amount of time until the promise resolves
+   * @returns Promise
+   */
+  async sleep (sleepTime) {
+    return new Promise(resolve => {
+      setTimeout(resolve, sleepTime)
+    })
+  },
+
+  /**
+   * Takes an array of numbers and simplifies it into a string containing ranges, e.g.:
+   * [0, 1, 2, 4, 6, 7, 8] --> "0-2, 4, 6-8"
+   * @param {array} numbers The input numbers
+   * @returns {string} The output string
+   */
+  simplifyNumbers (numbers) {
+    const output = []
+    let rangeStart
+    for (let i = 0; i < numbers.length; i++) {
+      const number = numbers[i]
+      const next = numbers[i + 1]
+
+      if (rangeStart != null && (next - number !== 1 || next == null)) {
+        output.push(`${rangeStart}-${number}`)
+        rangeStart = null
+      } else if (next == null || next - number !== 1) {
+        output.push(`${number}`)
+      } else if (rangeStart == null) {
+        rangeStart = number
+      }
+    }
+
+    return output.join(', ')
+  },
+
+  /**
+   * Takes a number and converts it into a simplified and human readable number
+   * 1,142,546 --> 1.1M
+   * @param {float} toCompress The number to compress
+   * @returns {string} The compressed number
+   */
+  toHumanReadableNumber (toCompress) {
+    const numberAbbreviations = ['K', 'M', 'B', 'T']
+    let compressedNumber = parseInt(toCompress, 10).toFixed(1)
+
+    // Count how many times the place is shifted
+    let placeShift = 0
+    while (compressedNumber >= 1000) {
+      compressedNumber = (compressedNumber / 1000).toFixed(1)
+      placeShift++
+    }
+
+    // If the number was simplified, put a number abbreviation on the end
+    // Removes the decimal if it wasn't
+    if (placeShift > 0) {
+      compressedNumber += numberAbbreviations[placeShift - 1]
+    } else {
+      compressedNumber = Math.floor(compressedNumber)
+    }
+    return compressedNumber
+  },
+
+  /**
+   * Returns an md5 hash of the input string.
+   * This is used for a key for a group binding. The key is the hash of the json of the rank binding.
+   * @param {string} string The input string.
+   * @returns {string} The md5 hash of the string.
+   */
+  md5 (string) {
+    return crypto.createHash('md5').update(string).digest('hex')
+  },
+
+  /**
+   * Gets group rank binding text for a binding.
+   * Turns a rank binding object into a human-readable format.
+   * @param {object} binding The binding object.
+   * @param {boolean} [addCodeBlock=false] Whether or not to wrap the binding in markdown code block.
+   * @returns {string} The binding in human-readable format.
+   */
+  getBindingText (binding, addCodeBlock = false) {
+    let bindingMessage = addCodeBlock ? '```markdown\n' : ''
+
+    if (binding.groups == null) {
+      return `\nInvalid Group Format - Unbind role ${binding.role} to fix this problem.\n`
+    }
+
+    for (const [index, group] of binding.groups.entries()) {
+      if (index > 0) bindingMessage += '...or\n'
+
+      if (group.id.match(/[a-z]/i)) {
+        bindingMessage += `# Virtual Group ${group.id}\n`
+        bindingMessage += `Argument ${group.ranks.length > 0 ? group.ranks[0] : 'none'}`
+      } else {
+        bindingMessage += `# Group ${group.id}\n`
+        bindingMessage += `Rank${group.ranks.length === 1 ? '' : 's'} ` + module.exports.simplifyNumbers(group.ranks)
+      }
+      bindingMessage += '\n\n'
+    }
+
+    return addCodeBlock ? bindingMessage + '\n```' : bindingMessage
+  },
+
+  /**
+   * Gets the user-facing link for the verification registry.
+   * This is not used for actually checking against the registry.
+   * This is for functionality in the future where we want to know where the user came from to help make sure that
+   * they are on the right account on the website by making sure the user is in the guild they came from.
+   * @param {Guild} guild The guild this link is being generated for.
+   * @returns {string} The link to the verification site
+   */
+  getVerifyLink (guild) {
+    return 'https://verify.eryn.io' // /?from=${guild.id}`
+  }
+}
+
+/* global Cache */
+
+const request = require('request-promise')
+
+// VirtualGroups can be used in place of group IDs for
+// group bindings. They are defined as keys in the
+// VirtualGroups object. It must be a function that
+// returns true or false.
+
+/**
+ * Check if the given user is in the Roblox Dev Forum.
+ *
+ * @param {object} user The user data
+ * @returns {object} The DevForum profile data
+ */
+async function getDevForumProfile (user) {
+  const userId = user.id
+  let userProfile = await Cache.get(`bindings.${user.id}`, 'DevForumProfile')
+
+  if (!userProfile) {
+    try {
+      const devForumData = await request({
+        uri: `https://devforum.roblox.com/u/by-external/${userId}.json`,
+        json: true,
+        simple: false
+      })
+
+      userProfile = devForumData.user
+
+      Cache.set(`bindings.${user.id}`, 'DevForumProfile', userProfile)
+    } catch (e) {
+      return false
+    }
+  }
+
+  return userProfile
+}
+
+/**
+ * @module VirtualGroups
+ */
+module.exports = {
+  async DevForumTopContributor (user) {
+    const userProfile = await getDevForumProfile(user)
+    if (!userProfile) return
+
+    return userProfile.groups.find(g => g.name === 'Top_Contributor') != null
+  },
+
+  async DevForumLeadTopContributor (user) { // old, left for compatability
+    const userProfile = await getDevForumProfile(user)
+    if (!userProfile) return
+
+    return userProfile.groups.find(g => g.name === 'Community_Sage') != null
+  },
+
+  async RobloxStaff (user) {
+    const userProfile = await getDevForumProfile(user)
+    if (!userProfile) return
+
+    return userProfile.groups.find(g => g.name === 'Roblox_Staff') != null
+  },
+
+  async CommunitySage (user) {
+    const userProfile = await getDevForumProfile(user)
+    if (!userProfile) return
+
+    return userProfile.groups.find(g => g.name === 'Community_Sage') != null
+  },
+
+  async PostApproval (user) {
+    const userProfile = await getDevForumProfile(user)
+    if (!userProfile) return
+
+    return userProfile.groups.find(g => g.name === 'Post_Approval') != null
+  },
+
+  /**
+   * Check if the given user is in the Roblox Dev Forum.
+   *
+   * @param {object} user The user data
+   * @param {int} trustLevel The trust level to check against
+   * @returns {boolean} The resolution of the binding
+   */
+  async DevForumAccess (user, trustLevelCheck) {
+    const userProfile = await getDevForumProfile(user)
+    if (!userProfile) return
+
+    const userTrustLevel = userProfile.trust_level
+
+    if (trustLevelCheck == null && userTrustLevel > 0) {
+      return true
+    }
+
+    // !userTrustLevel also returns true when it is 0, causing it to return false
+    // this is why we check it with == null, in case it is actually 0
+    // if trustLevelCheck is null now, that means their trust level is 0
+    if (trustLevelCheck == null || userTrustLevel == null || !trustLevelCheck(userTrustLevel) || userProfile.suspended_till) {
+      return false
+    }
+
+    return true
+  },
+
+  async DevForum (user) { // old, left for compatibility
+    return module.exports.DevForumAccess(user, x => x === 2)
+  },
+
+  async DevForumBasic (user) { // old, left for compatibility
+    return module.exports.DevForumAccess(user, x => x === 1)
+  },
+
+  async DevForumMember (user) { // old, left for compatibility
+    return module.exports.DevForumAccess(user, x => x >= 2)
+  },
+
+  async DevForumVisitor (user) {
+    return module.exports.DevForumAccess(user, x => x === 0)
+  },
+
+  async DevForumNewMember (user) {
+    return module.exports.DevForumAccess(user, x => x === 1)
+  },
+
+  async DevForumRegular (user) {
+    return module.exports.DevForumAccess(user, x => x >= 2)
+  },
+
+  /**
+   * Returns if the user has the specified type of bc
+   * @param {object} user The user data
+   * @param {string} [bcType] The type of BC to check for, if omitted works for any bc
+   * @returns {boolean} The binding resolution
+   * @todo Fix the caching on this. Currently, as all bindings execute at the same time,
+   * @todo this won't actually ever cache because they are all requesting. (only if more than one BC bound)
+   */
+  async BuildersClub (user, bcType) {
+    const { cookie } = require('./data/client.json')
+    if (!cookie) return false
+    let bc = await Cache.get(`bindings.${user.id}`, 'bc')
+    if (!bc) {
+      const response = await request({
+        uri: `https://premiumfeatures.roblox.com/v1/users/${user.id}/validate-membership`,
+        simple: false,
+        json: true,
+        resolveWithFullResponse: true,
+        headers: {
+          cookie: `.ROBLOSECURITY=${cookie}` // Send cookie as a header to avoid using another dependency to insert the cookie
+        }
+      })
+      bc = 'NBC'
+      if (response.body && response.statusCode === 200) {
+        bc = 'Premium'
+      }
+
+      Cache.set(`bindings.${user.id}`, 'bc', bc)
+    }
+
+    if (bcType && bcType === bc) {
+      return true
+    } else if (!bcType && bc !== 'NBC') {
+      return true
+    }
+
+    return false
+  },
+
+  async Premium (user) {
+    return module.exports.BuildersClub(user, 'Premium')
+  },
+
+  async NBC (user) {
+    return module.exports.BuildersClub(user, 'NBC')
+  },
+
+  /**
+   * Returns true if a given user is an ally or enemy of a given group.
+   * @param {object} user The user to check
+   * @param {number} groupid The group id
+   * @param {DiscordServer} DiscordServer DiscordServer static reference
+   * @param {"allies" | "enemies"} [relation] The relationship type to check.
+   * @returns {boolean} True if user meets relationship requirement.
+   */
+  async _Relationship (user, groupid, DiscordServer, relation = 'allies') {
+    if (relation !== 'allies' && relation !== 'enemies') {
+      throw new Error('Invalid relationship type!')
+    }
+
+    const userGroups = await DiscordServer.getRobloxMemberGroups(user.id)
+
+    // Important to cache group relationships, as this is an expensive operation
+    let allies = await Cache.get(`groups.${groupid}`, relation)
+    if (allies == null) {
+      allies = []
+
+      // Roblox ally/enemy APIs must specify an amount. Only grab 60 relationships
+      const content = await request(`https://groups.roblox.com/v1/groups/${groupid}/relationships/${relation}?model.startRowIndex=0&model.maxRows=60`, {
+        json: true
+      })
+
+      for (const group of content.relatedGroups) {
+        allies.push(group.id)
+      }
+
+      Cache.set(`groups.${groupid}`, relation, allies)
+    }
+
+    for (const group of userGroups) {
+      if (allies.includes(group.group.id)) {
+        return true
+      }
+    }
+  },
+
+  async Ally (user, groupid, DiscordServer) {
+    return module.exports._Relationship(user, groupid, DiscordServer, 'allies')
+  },
+
+  async Enemy (user, groupid, DiscordServer) {
+    return module.exports._Relationship(user, groupid, DiscordServer, 'enemies')
+  },
+
+  /**
+   * Returns true if a given user is friends with a given user.
+   * @param {object} user The user to check
+   * @param {number} friendid The friend id
+   * @returns {boolean} True if user is friends with the given user.
+   */
+  async Friend (user, friendid) {
+    try {
+      let friends = await Cache.get(`bindings.${user.id}`, 'friends')
+      if (!friends) {
+        friends = (await request({
+          uri: `https://friends.roblox.com/v1/users/${user.id}/friends`,
+          simple: false,
+          json: true
+        })).data
+
+        Cache.set(`bindings.${user.id}`, 'friends', friends)
+      }
+
+      return friends.find(user => user.id.toString() === friendid.toString()) != null
+    } catch (e) {
+      // Do nothing
+    }
+
+    return false
+  },
+
+  /**
+   * Checks if a user owns a specific item on Roblox.
+   * @param {object} user The user data.
+   * @param {int} itemId The item id.
+   * @param {DiscordServer} DiscordServer DiscordServer
+   * @param {string} [itemType='Asset'] The item type.
+   * @returns
+   */
+  async _Ownership (user, itemId, _, itemType = 'Asset') {
+    try {
+      let doesHaveAsset = await Cache.get(`bindings.${user.id}`, `${itemType}.${itemId}`)
+      if (doesHaveAsset == null) {
+        const responseData = await request({
+          uri: `https://inventory.roblox.com/v1/users/${user.id}/items/${itemType}/${itemId}`,
+          simple: false,
+          json: true
+        })
+
+        doesHaveAsset = responseData.data.length > 0
+        Cache.set(`bindings.${user.id}`, `${itemType}.${itemId}`, doesHaveAsset)
+      }
+
+      return doesHaveAsset
+    } catch (e) {
+      // Do nothing
+    }
+
+    return false
+  },
+
+  // HasAsset for backwards compatibility
+  async HasAsset (user, itemId) {
+    return module.exports._Ownership(user, itemId, undefined, 'Asset')
+  },
+
+  async Asset (user, itemId) {
+    return module.exports._Ownership(user, itemId, undefined, 'Asset')
+  },
+
+  async GamePass (user, itemId) {
+    return module.exports._Ownership(user, itemId, undefined, 'GamePass')
+  },
+
+  async Badge (user, itemId) {
+    return module.exports._Ownership(user, itemId, undefined, 'Badge')
+  }
+}
+
+const path = require('path')
+const Discord = require('discord.js-commando')
+const request = require('request-promise')
+const config = require('./data/client.json')
+const DiscordServer = require('./DiscordServer')
+const { Cache } = require('./GlobalCache')
+const requestDebug = require('request-debug')
+const SettingProvider = require('./commands/SettingProvider')
+const Util = require('./Util')
+const fs = require('mz/fs')
+
+if (config.loud) requestDebug(request, (type, data) => console.log(`${type} ${data.debugId} : ${data.uri || data.statusCode}`))
+
+/**
+ * The main Discord bot class, only one per shard.
+ * @class DiscordBot
+ */
+class DiscordBot {
+  constructor () {
+    this.initialize()
+    this.servers = {}
+    this.authorizedOwners = []
+    this.patronTransfers = {}
+    this.blacklist = {}
+  }
+
+  /**
+   * Initialize the bot, hook up events, and log in.
+   * @memberof DiscordBot
+   */
+  initialize () {
+    this.bot = new Discord.Client({
+      apiRequestMethod: config.apiRequestMethod || 'sequential',
+      disabledEvents: ['TYPING_START', 'VOICE_STATE_UPDATE', 'PRESENCE_UPDATE', 'MESSAGE_DELETE', 'MESSAGE_UPDATE', 'CHANNEL_PINS_UPDATE', 'MESSAGE_REACTION_ADD', 'MESSAGE_REACTION_REMOVE', 'MESSAGE_REACTION_REMOVE_ALL', 'CHANNEL_PINS_UPDATE', 'MESSAGE_DELETE_BULK', 'WEBHOOKS_UPDATE'],
+      owner: config.owner || '0',
+      commandPrefix: config.commandPrefix || '!',
+      unknownCommandResponse: false,
+      disableMentions: 'everyone',
+      messageCacheMaxSize: 0,
+      retryLimit: 0,
+      ws: {
+        intents: ["GUILD_MEMBERS", "GUILDS", "GUILD_MESSAGES"],
+      },
+    })
+
+    this.bot.setProvider(new SettingProvider())
+
+    // Instantiate the shard's Cache singleton to interface with the main process.
+    // A global variable is used here because the cache is dependent on the client
+    // being initialized, but I don't like the idea of having to pass down the cache
+    // from this object into every instance (DiscordMember, DiscordServer). This seemed
+    // like the best solution.
+    global.Cache = new Cache(this.bot)
+    this.shardClientUtil = global.Cache.shardClientUtil
+
+    // Set a reference to this instance inside of the client
+    // for use in Commando modules. Is this bad? Probably.
+    this.bot.discordBot = this
+
+    // Events
+
+    // We use .bind(this) so that the context remains within
+    // the class and not the event.
+    // this.bot.on('debug', (info) => { console.log(`[DEBUG SHARD${this.bot.shard.ids[0]}] ${info}`)})
+    this.bot.on('warn', (info) => { console.log(`[WARN SHARD${this.bot.shard.ids[0]}] ${info}`)})
+    this.bot.on('rateLimit', (err) => { console.error(`[RL SHARD${this.bot.shard.ids[0]}] ${JSON.stringify(err)}`)})
+    this.bot.on('error', (err) => { console.error(`[ERR SHARD${this.bot.shard.ids[0]}] `, err)})
+    this.bot.on('shardError', (err, id) => { console.error(`[WS SHARD${id}] ${JSON.stringify(err)}`)})
+    this.bot.on('shardDisconnect', (event, id) => { console.error(`[WS SHARD${id}] ${JSON.stringify(event)}`)})
+    process.on('unhandledRejection', (reason, promise) => {
+      console.log('Unhandled Rejection at:', promise, 'reason:', reason);
+    });
+    this.bot.on('ready', this.ready.bind(this))
+    this.bot.on('guildMemberAdd', this.guildMemberAdd.bind(this))
+
+    this.bot.on('message', this.message.bind(this))
+
+    this.bot.on('invalidated', () => { // This should never happen!
+      console.error(`Sesson on shard ${this.bot.shard.ids[0]} invalidated - exiting!`)
+      process.exit(0)
+    })
+
+    if (config.loud) {
+      this.bot.on('error', (message) => console.log(message))
+      process.on('unhandledRejection', (reason, promise) => {
+        console.log('Unhandled rejection at:', promise, 'reason:', reason)
+      })
+    }
+
+    this.bot.dispatcher.addInhibitor(msg => {
+      if (!msg.guild) {
+        return
+      }
+
+      if (this.blacklist[msg.guild.ownerID]) {
+        msg.reply("This server is blacklisted!")
+        return 'blacklisted'
+      }
+    })
+
+    if (this.isPremium()) {
+      this.bot.dispatcher.addInhibitor(msg => {
+        if (msg.guild && !this.authorizedOwners.includes(msg.guild.ownerID)) {
+          if (this.authorizedOwners.length === 0) {
+            msg.reply('Sorry, the authorized users list is still being downloaded. This occurs when the bot has recently restarted. Please wait a few seconds and try again.')
+          } else {
+            msg.reply(`Sorry, this server isn't authorized to use RoVer Plus.${msg.member.hasPermission(['MANAGE_GUILD']) ? ' The server owner needs to donate at <https://www.patreon.com/erynlynn>, or you can invite the regular RoVer bot at <https://RoVer.link>.' : ''} If you are a patron encountering this issue, try running '${this.bot.commandPrefix}transferplus ${msg.guild.ownerID}'`) // notify sender to donate only if they're an "admin"
+          }
+
+          return 'not_premium'
+        }
+      })
+
+      this.updatePatrons()
+
+      setInterval(() => {
+        const beforePatrons = this.authorizedOwners
+        this.updatePatrons().catch((updateError) => {
+          console.error(`Patron update failed! ${updateError}`)
+
+          this.authorizedOwners = beforePatrons
+        })
+      }, 5 * 60 * 1000)
+    }
+
+    // Register commands
+    this.bot.registry
+      .registerGroup('rover', 'RoVer')
+      .registerDefaultTypes()
+      .registerDefaultGroups()
+      .registerDefaultCommands({
+        ping: false,
+        commandState: false,
+        prefix: true,
+        help: true,
+        unknownCommand: false
+      })
+      .registerCommandsIn(path.join(__dirname, 'commands'))
+
+    // Login.
+    this.bot.login(process.env.CLIENT_TOKEN)
+
+    this.updateBlacklist().catch(console.error)
+  }
+
+  isPremium () {
+    return !!config.patreonAccessToken
+  }
+
+  async updateBlacklist () {
+    if (!config.banServer) {
+      return false
+    }
+
+    const response = await request(`https://discord.com/api/v6/guilds/${config.banServer}/bans`, {
+      json: true,
+      headers: {
+        Authorization: `Bot ${config.token}`
+      }
+    })
+
+    response.forEach(ban => {
+      this.blacklist[ban.user.id] = true
+    })
+  }
+
+  async updateBlacklist () {
+    if (!config.banServer) {
+      return false
+    }
+
+    const response = await request(`https://discord.com/api/v6/guilds/${config.banServer}/bans`, {
+      json: true,
+      headers: {
+        Authorization: `Bot ${config.token}`
+      }
+    })
+
+    response.forEach(ban => {
+      this.blacklist[ban.user.id] = true
+    })
+  }
+
+  async updatePatrons (page, newAuthorizedOwners) {
+    if (!page) {
+      newAuthorizedOwners = []
+    }
+
+    const transferFilePath = path.join(__dirname, './data/transfers.csv')
+
+    if (await fs.exists(transferFilePath)) {
+      const contents = await fs.readFile(transferFilePath, {
+        encoding: 'utf8'
+      })
+
+      this.patronTransfers = contents.split(/\n\r?/)
+        .map(line => line.split(','))
+        .reduce((a, transfer) => {
+          a[transfer[0]] = transfer[1]
+          return a
+        }, {})
+    }
+
+    const url = page || `https://www.patreon.com/api/oauth2/api/campaigns/${config.patreonCampaignId}/pledges?include=patron.null`
+
+    const response = await request(url, {
+      json: true,
+      headers: {
+        Authorization: `Bearer ${config.patreonAccessToken}`
+      }
+    })
+
+    newAuthorizedOwners = [
+      config.owner || '0',
+      ...(config.patreonOverrideOwners || []),
+      ...newAuthorizedOwners,
+      ...(
+        response.data.filter(pledge => (
+          pledge.attributes.declined_since === null
+        )).map(pledge => (
+          response.included.find(include => include.id === pledge.relationships.patron.data.id)
+        )).filter(include => (
+          include.attributes.social_connections &&
+          include.attributes.social_connections.discord
+        )).map(include => (
+          include.attributes.social_connections.discord.user_id
+        ))
+      )
+    ].map(id => this.patronTransfers[id] || id)
+
+    if (response.links && response.links.next) {
+      return this.updatePatrons(response.links.next, newAuthorizedOwners)
+    } else {
+      this.authorizedOwners = newAuthorizedOwners
+    }
+  }
+
+  /**
+   * Called when the bot is ready and has logged in.
+   * @listens Discord.Client#ready
+   * @memberof DiscordBot
+   */
+  ready () {
+    console.log(`Shard ${this.bot.shard.ids[0]} is ready, serving ${this.bot.guilds.cache.array().length} guilds.`)
+
+    // Set status message to the default until we get info from master process
+    this.bot.user.setActivity('rover.link', { type: "LISTENING" })
+  }
+
+  /**
+   * This method is called when a user sends a message, but it's used
+   * for setting their nickname back to what it should be if they've
+   * changed it. Only active if lockNicknames is true in config.
+   * @listens Discord.Client#message
+   * @param {Message} message The new message.
+   * @memberof DiscordBot
+   */
+  async message (message) {
+    // Don't want to do anything if this is a DM or message was sent by the bot itself.
+    // Additionally, if the message is !verify, we don't want to run it twice (since it
+    // will get picked up by the command anyway)
+    if (!message.guild || message.author.id === this.bot.user.id || message.cleanContent.toLowerCase() === message.guild.commandPrefix + 'verify' || message.author.bot) {
+      return
+    }
+
+    // We call discordMember.verify but we want to retain the cache
+    // and we don't want it to post any announcements.
+    const server = await this.getServer(message.guild.id)
+    const member = await server.getMember(message.author.id)
+    if (!member) return
+
+    // If this is the verify channel, we want to delete the message and just verify the user if they aren't an admin.
+    if (server.getSetting('verifyChannel') === message.channel.id && message.cleanContent.toLowerCase() !== message.guild.commandPrefix + 'verify' && !(this.bot.isOwner(message.author) || message.member.hasPermission('MANAGE_GUILD') || message.member.roles.cache.find(role => role.name === 'RoVer Admin'))) {
+      if (message.channel.permissionsFor(message.guild.me).has('MANAGE_MESSAGES')) {
+        message.delete().catch(console.error)
+      }
+      return member.verify({ message })
+    }
+
+    if (!config.disableAutoUpdate && member.shouldUpdateNickname(message.member.displayName) && config.lockNicknames) {
+      // As a last resort, we just verify with cache on every message sent.
+      await member.verify({
+        announce: false,
+        clearBindingsCache: false
+      })
+    }
+  }
+
+  /**
+   * This is called when a user joins any Discord server.
+   * @listens Discord.Client#guildMemberAdd
+   * @param {GuildMember} member The new guild member
+   * @memberof DiscordBot
+   */
+  async guildMemberAdd (member) {
+    if (member.user.bot) return
+
+    const server = await this.getServer(member.guild.id)
+
+    if (server.getSetting('joinDM') === false) {
+      return
+    }
+
+    const discordMember = await server.getMember(member.id)
+    if (!member) return
+
+    // Check the guild's verification level
+    const securityLevel = member.guild.verificationLevel
+    const securityMessageIntro = `Welcome to ${member.guild.name}! This Discord server uses a Roblox account verification system to keep our community safe. Due to this server's security settings,`
+    if (securityLevel === 'MEDIUM' && (member.joinedTimestamp - member.user.createdTimestamp < 300000)) {
+      member.send(`${securityMessageIntro} you must wait until your account is at least 5 minutes old to verify. Once the time is up, run \`${member.guild.commandPrefix}verify\` in the server to verify.`).catch(() => {})
+      return
+    } else if (securityLevel === 'HIGH') {
+      member.send(`${securityMessageIntro} you must wait 10 minutes to verify if you do not have a phone number linked to your Discord account. If you do have a linked phone number, you may immediately run \`${member.guild.commandPrefix}verify\` in the server.`).catch(() => {})
+      return
+    } else if (securityLevel === 'VERY_HIGH') {
+      member.send(`${securityMessageIntro} you must link your phone number to your Discord account. If you have already done so, you may run \`${member.guild.commandPrefix}verify\` in the server.`).catch(() => {})
+      return
+    }
+    const action = await discordMember.verify()
+
+    try {
+      if (action.status) {
+        member.send(server.getWelcomeMessage(action, member)).catch(() => {})
+      } else if (!action.status && action.nonFatal) {
+        member.send(`Welcome to ${member.guild.name}! You are already verified, but something went wrong when updating your roles. Try running \`${member.guild.commandPrefix}verify\` in the server for more information.`).catch(() => {})
+      } else {
+        member.send(`Welcome to ${member.guild.name}! This Discord server uses a Roblox account verification system to keep our community safe. Verifying your account is quick and safe and doesn't require any information other than your username. All you have to do is either join a game or put a code in your profile, and you're in!\n\nVisit the following link to verify your Roblox account: ${Util.getVerifyLink(member.guild)}`).catch(() => {})
+      }
+    } catch (e) {}
+  }
+
+  /**
+   * Sets the bot's status text.
+   * @param {string} text The status message.
+   * @param {string} activityType The activity type.
+   * @memberof DiscordBot
+   */
+  setActivity (text, activityType) {
+    if (!this.bot || !this.bot.user) return
+
+    this.bot.user.setActivity(text || 'http://eryn.io/RoVer', { type: activityType })
+  }
+
+  /**
+   * This is used to get the DiscordServer instance associated
+   * with the specific guild id.
+   * @param {Snowflake} id Guild id
+   * @returns {Promise<DiscordServer>} DiscordServer
+   * @memberof DiscordBot
+   */
+  async getServer (id) {
+    if (!this.servers[id]) {
+      this.servers[id] = new DiscordServer(this, id)
+      await this.servers[id].loadSettings()
+    } else if (!this.servers[id].areSettingsLoaded) {
+      await this.servers[id].loadSettings()
+    }
+    return this.servers[id]
+  }
+
+  /**
+   * This is called by the update server when a user verifies
+   * online. It updates the member in every DiscordServer they
+   * are in.
+   * @param {object} args An object with keys `id` (string) and `guilds` (array)
+   * @memberof DiscordBot
+   */
+  async globallyUpdateMember (args) {
+    const { id, guilds } = args
+
+    // Start off by clearing their global cache.
+    await DiscordServer.clearMemberCache(id)
+
+    let firstRun = true
+
+    // Iterate through all of the guilds the bot is in.
+    for (const guildId of guilds) {
+      try {
+        if (!this.bot.guilds.cache.has(guildId)) continue
+
+        const guild = this.bot.guilds.resolve(guildId)
+        const server = await this.getServer(guild.id)
+
+        const member = await server.getMember(id)
+        if (!member) continue
+        if (
+          guild.verificationLevel === 'MEDIUM' && member.user.createdTimestamp < Date.now() - 300000 ||
+          guild.verificationLevel === 'HIGH' && member.joinedTimestamp < Date.now() - 600000 ||
+          guild.verificationLevel === 'VERY_HIGH'
+        ) continue
+        const action = await member.verify({
+          // We want to clear the group rank bindings cache because
+          // this is the first iteration.
+          clearBindingsCache: firstRun
+        })
+
+        if (!action.status && !action.nonFatal) {
+          // If there's a fatal error, don't continue with the rest.
+          break
+        } else if (action.status && server.hasCustomWelcomeMessage()) {
+          // It worked, checking if there's a custom welcome message.
+          await this.bot.users.fetch(id)
+
+          const guildMember = await this.bot.guilds.resolve(guild.id).members.fetch(id)
+          guildMember.send(server.getWelcomeMessage(action, guildMember)).catch(() => {})
+        }
+
+        firstRun = false
+      } catch (e) {
+        continue
+      }
+    }
+  }
+}
+
+module.exports = DiscordBot
+
+/* global Cache */
+const { stripIndents } = require('common-tags')
+const config = require('./data/client.json')
+const Util = require('./Util')
+
+const request = require('request-promise').defaults({ pool: { maxSockets: Infinity } })
+
+let DiscordServer
+const VerificationAttempts = new Map()
+
+/**
+ * A representation of a Discord guild member.
+ * @class DiscordMember
+ */
+class DiscordMember {
+  /**
+   * Creates an instance of DiscordMember.
+   * @param {DiscordServer} discordServer The DiscordServer to which this DiscordMember belongs
+   * @param {Snowflake} id The user id
+   * @hideconstructor
+   */
+  constructor (discordServer, id) {
+    this.discordServer = discordServer
+    this.id = id
+
+    this.bot = this.discordServer.bot
+    this.server = this.discordServer.server
+
+    // Have to do this to prevent circular reference in file requires
+    // Gets a reference to DiscordServer so we can run static methods
+    DiscordServer = this.discordServer.constructor
+  }
+
+  /**
+   * Creates, prepares, and returns a new DiscordMember
+   *
+   * @static
+   * @param {DiscordServer} discordServer The DiscordServer to which this DiscordMember belongs
+   * @param {Snowflake} id The user id
+   * @returns {Promise<DiscordMember>} The newly created and prepared DiscordMember
+   * @memberof DiscordMember
+   */
+  static async new (discordServer, id) {
+    const discordMember = new DiscordMember(discordServer, id)
+
+    if (!await discordMember.prepareMember()) {
+      return false
+    }
+
+    return discordMember
+  }
+
+  /**
+   * Fetches the user and member from Discord
+   * @returns {Promise<boolean>} True if the member exists
+   * @memberof DiscordMember
+   */
+  async prepareMember () {
+    try {
+      this.user = await this.bot.users.fetch(this.id, true)
+      this.member = await this.server.members.fetch(this.user, true)
+      return true
+    } catch (e) {
+      if (config.loud) console.log(`prepareMember: ${e.message}; ${this.id}; ${this.user}`)
+      return false
+    }
+  }
+
+  getCachedNickname () {
+    return this.discordServer.nicknames.get(this.id)
+  }
+
+  shouldUpdateNickname (currentName) {
+    if (this.discordServer.getSetting('nicknameUsers')) {
+      return !this.discordServer.nicknames.has(this.id) ||
+        this.discordServer.nicknames.get(this.id) !== currentName
+    } else {
+      return false
+    }
+  }
+
+  /**
+   * Gets a member's nickname, formatted with this server's specific settings.
+   *
+   * @param {object} data String replacement data
+   * @returns {string} The formatted nickname
+   * @memberof DiscordMember
+   */
+  async getNickname (data) {
+    const nicknameData = {
+      robloxUsername: data.robloxUsername,
+      robloxId: data.robloxId,
+      discordId: data.discordId,
+      discordName: data.discordName
+    }
+
+    if (this.discordServer.getSetting('nicknameGroup')) {
+      const apiRank = await DiscordServer.getRobloxMemberGroups(nicknameData.robloxId)
+
+      for (const groups of apiRank) {
+        if (parseInt(groups.group.id) === parseInt(this.discordServer.getSetting('nicknameGroup'))) {
+          const rankMatch = groups.role.name.match(/(.+(?:\]|\)|\}|\|))/)
+          nicknameData.groupRank = rankMatch ? rankMatch[1] : `[${groups.role.name}]`
+          break
+        }
+      }
+      nicknameData.groupRank = nicknameData.groupRank || '[Guest]'
+    }
+    return Util.formatDataString(this.discordServer.getSetting('nicknameFormat'), nicknameData, this.member)
+  }
+
+  /**
+   * Called to update the state of a specific member in this Discord server.
+   *
+   * @param {object} options Options for the verification
+   * @param {boolean} options.announce Whether or not to announce this verification
+   * @param {boolean} options.clearBindingsCache Whether or not to clear the bindings cache before verifying
+   * @param {boolean} options.skipWelcomeMessage Whether or not to use a generic success message than the server welcome message
+   * @param {boolean} options.message The message to edit and update throughout the verification
+   * @returns {object} VerificationResult
+   * @returns {boolean} VerificationResult.status - Whether or not the verification was successful
+   * @returns {boolean} VerificationResult.error - What went wrong
+   * @returns {boolean} VerificationResult.nonFatal - If the verification error was fatal (e.g., this error would occur on any guild, not just this one)
+   * @memberof DiscordMember
+   */
+  async verify (options) {
+    options = options || {}
+
+    let data = {}
+    let freshData = false
+    const errorAppend = ''
+
+    if (!this.discordServer.areSettingsLoaded) {
+      await this.discordServer.loadSettings()
+    }
+
+    if (!this.discordServer.isAuthorized()) {
+      return
+    }
+
+    // We only want to cleanup rank bindings if this is a manually-invoked verification.
+    if (options.clearBindingsCache !== false) {
+      this.discordServer.cleanupRankBindings(options.message ? options.message.channel : undefined)
+    }
+
+    if (options.message) {
+      // Verification cooldown
+      if (this.discordServer.verifyCooldowns.has(this.id) && Date.now() - this.discordServer.verifyCooldowns.get(this.id) < 5000) {
+        return {
+          status: false,
+          nonFatal: true,
+          error: ':alarm_clock: Please wait at least five seconds before trying to verify again.'
+        }
+      }
+
+      this.discordServer.verifyCooldowns.set(this.id, Date.now())
+
+      // Clear the request cache so we get fresh information.
+      // We only want to clear on manually-invoked verifications.
+      await DiscordServer.clearMemberCache(this.id)
+    }
+
+    // Fetch newest data? Please?
+    this.member = await this.server.members.fetch({
+      user: this.user,
+      cache: false
+    })
+
+    // Fetch newest data? Please?
+    this.member = await this.server.members.fetch({
+      user: this.user,
+      cache: false
+    })
+
+    // If options.message is provided, we reply to that message with a status update
+    // and edit it with new info throughout the verification. It's also called upon
+    // this function returning output, so we need a default state for it to be a
+    // simple passthrough function.
+    let status = action => action
+
+    if (options.message) {
+      // Create the status message and save initial information.
+      const statusMessage = await options.message.reply(':thought_balloon: Checking permissions...')
+
+      // We don't want to edit the message too quickly, otherwise Discord will throttle us. T
+      // This limits edits to one per second but keeps it up to date after at least 1 second passes.
+      let lastEdit = (new Date()).getTime()
+      let editIndex = 0
+      status = action => {
+        editIndex++
+        const thisIndex = editIndex
+
+        // A self-invoking async function so that we can delay the message sending if necessary,
+        // but we don't delay the return value.
+        ;(async () => {
+          if ((new Date()).getTime() - lastEdit < 5000) {
+            await Util.sleep(5000 - ((new Date()).getTime() - lastEdit))
+
+            if (editIndex !== thisIndex) {
+              // A new message has been sent since this was called, so ignore it.
+              return
+            }
+          }
+
+          lastEdit = (new Date()).getTime()
+
+          if (typeof action === 'string') {
+            statusMessage.edit(`${this.member}, ${action}`)
+          } else if (action.error != null) {
+            statusMessage.edit(`${this.member}, :exclamation:${action.error.startsWith(':') ? '' : ' '}${action.error}`)
+          } else if (action.status === true) {
+            let welcomeMessage = this.discordServer.getWelcomeMessage(action, this.member)
+            if (options.skipWelcomeMessage) {
+              welcomeMessage = `${this.member.displayName} has been verified.`
+            }
+
+            statusMessage.edit(`${options.message.author}, :white_check_mark: ${welcomeMessage}`)
+          }
+        })()
+
+        return action
+      }
+    }
+
+    // Check if the user is even in the server
+    if (!this.member && !await this.prepareMember()) {
+      return status({
+        status: false,
+        error: ":mag: We couldn't find that user here.",
+        nonFatal: true
+      })
+    }
+
+    // We don't want to work with bots
+    if (this.user.bot) {
+      return status({
+        status: false,
+        error: ':robot: RoVer cannot verify bots.'
+      })
+    }
+
+    // Ignore users with this specific role (to give server owners more power)
+    if (this.member.roles.cache.find(role => role.name === 'RoVer Bypass')) {
+      return status({
+        status: false,
+        error: ':octagonal_sign: RoVer cannot act on users with the "RoVer Bypass" role.',
+        nonFatal: true
+      })
+    }
+
+    const botMember = this.server.me
+
+    if (!this.member.manageable || !botMember.hasPermission('MANAGE_ROLES')) {
+      return status({
+        status: false,
+        error: this.member.guild.ownerID === this.member.id ? '\n\nYou are the server owner. RoVer cannot make changes to you. This is a Discord restriction. If you want, you can change your own nickname.' : "\n\nRoVer can't manage this user. Please have a server admin drag RoVer's role above all other roles and ensure RoVer has permission to modify roles in order to fix this problem.",
+        nonFatal: true
+      })
+    }
+
+    status(':scroll: Checking the verification registry...')
+
+    try {
+      // Read user data from memory, or request it if there isn't any cached.
+      data = await Cache.get('users', this.id)
+      if (!data) {
+        data = await request({
+          uri: `https://verify.eryn.io/api/user/${this.id}`,
+          json: true,
+          simple: false
+        })
+        freshData = true
+
+        // Cache the data for future use.
+        await Cache.set('users', this.id, data)
+      }
+    } catch (e) {
+      if (config.loud) console.log(e)
+      return status({
+        status: false,
+        error: 'There was an error while trying to fetch this user\'s verification data!'
+      })
+    }
+
+    // If the status is ok, the user is in the database.
+    if (data.status === 'ok') {
+      // We only want to update the username if this data isn't from the cache.
+      if (freshData) {
+        status(':newspaper: Getting latest profile information...')
+        // Resolve the Roblox username from the user id.
+        let apiUserData = {}
+        try {
+          apiUserData = await request({
+            uri: `https://users.roblox.com/v1/users/${data.robloxId}`,
+            json: true,
+            simple: false
+          })
+        } catch (e) {
+          if (config.loud) console.log(e)
+          return status({
+            status: false,
+            error: 'There was an error while fetching the user\'s data!'
+          })
+        }
+
+        if (apiUserData.errors && apiUserData.errors[0] && apiUserData.errors[0].code === 0) {
+          return status({
+            status: false,
+            error: 'Roblox is currently undergoing maintenance. Please try again later.'
+          })
+        }
+
+        if (apiUserData.name) {
+          data.robloxUsername = apiUserData.name
+        }
+
+        // Cache data again
+        Cache.set('users', this.id, data)
+      }
+
+      // Check if these settings are enabled for this specific server,
+      // if so, then put the member in the correct state.
+
+      status(':dividers:️ Updating your nickname and roles...')
+
+      if (this.discordServer.getSetting('verifiedRole')) {
+        const role = this.discordServer.getSetting('verifiedRole')
+        if (!this.member.roles.cache.has(role) && this.server.roles.cache.has(role) && this.discordServer.canManageRole(role)) {
+          try {
+            await this.member.roles.add(role)
+          } catch (e) {
+            if (config.loud) console.log(e)
+            return status({
+              status: false,
+              nonFatal: true,
+              error: "There was an error while trying to assign the verified role! Ensure RoVer's role is above it." + errorAppend
+            })
+          }
+        }
+      }
+
+      if (this.discordServer.getSetting('verifiedRemovedRole')) {
+        const role = this.discordServer.getSetting('verifiedRemovedRole')
+        if (this.member.roles.cache.has(role) && this.server.roles.cache.has(role) && this.discordServer.canManageRole(role)) {
+          try {
+            await this.member.roles.remove(role)
+          } catch (e) {
+            if (config.loud) console.log(e)
+            return status({
+              status: false,
+              nonFatal: true,
+              error: "There was an error while trying to remove the verified role! Ensure RoVer's role is above it." + errorAppend
+            })
+          }
+        }
+      }
+
+      if (
+        this.discordServer.getSetting('nicknameUsers') &&
+        !this.member.roles.cache.find(role => role.name === 'RoVer Nickname Bypass') &&
+        botMember.hasPermission('MANAGE_NICKNAMES')
+      ) {
+        const nickname = (await this.getNickname(data)).substring(0, 32)
+
+        this.discordServer.nicknames.set(this.id, nickname)
+
+        if (this.member.displayName !== nickname) {
+          try {
+            await this.member.setNickname(nickname)
+          } catch (e) {
+            if (config.loud) console.log(e)
+            return status({
+              status: false,
+              nonFatal: true,
+              error: this.member.guild.ownerID === this.member.id ? "Sorry, Discord doesn't allow bots to change the server owner's nickname. Please manually update your nickname. Or don't, I'm just an error message." : "RoVer doesn't have permission to change that user's nickname." + errorAppend
+            })
+          }
+        }
+      }
+
+      if (options.announce !== false) {
+        this.discordServer.announce('User Verified', `<@${this.id}> verified as [${data.robloxUsername}](https://www.roblox.com/users/${data.robloxId}/profile)`)
+      }
+
+      // Check if we want to resolve group rank bindings with cached or fresh data.
+      if (options.clearBindingsCache !== false) {
+        await Cache.clear(`bindings.${data.robloxId}`)
+      }
+
+      // Resolve group rank bindings for this member.
+      if (this.discordServer.getSetting('groupRankBindings').length > 0) {
+        status(':mag_right: Checking group ranks...')
+
+        await DiscordServer.getRobloxMemberGroups(data.robloxId)
+
+        const promises = []
+        for (const binding of this.discordServer.getSetting('groupRankBindings')) {
+          // We use a Promise.then here so that they all execute asynchronously.
+          promises.push(DiscordServer.resolveGroupRankBinding(binding, data.robloxId, data.robloxUsername)
+            .then((state) => {
+              const hasRole = this.member.roles.cache.get(binding.role) != null
+              if (hasRole === state) return
+
+              if (!this.server.roles.cache.has(binding.role)) return
+
+              if (!this.discordServer.canManageRole(binding.role)) return
+
+              if (state === true) {
+                this.member.roles.add(binding.role).catch(e => {})
+              } else {
+                this.member.roles.remove(binding.role).catch(e => {})
+              }
+            })
+          )
+        }
+
+        try {
+          await Promise.all(promises)
+        } catch (e) {
+          console.log(e)
+          return status({
+            status: false,
+            nonFatal: true,
+            error: "Something went wrong when checking group membership. It appears the Roblox group API is offline or returning malformed data. It's possible Roblox is down for maintenance or there is something else wrong with Roblox. Please try again later. If this problem is unique or is lasting longer than is expected, please join our support server by saying `!support`."
+          })
+        }
+      }
+
+      // Clear verification attempt history
+      VerificationAttempts.delete(this.id)
+
+      return status({
+        status: true,
+        robloxUsername: data.robloxUsername,
+        robloxId: data.robloxId,
+        discordId: this.member.id,
+        discordName: this.member.user.username
+      })
+    } else {
+      // Status was not "ok".
+      switch (data.errorCode) {
+        case 404: {
+          // User isn't in the database.
+          // Add the "Not Verified" role to the user.
+
+          if (this.discordServer.getSetting('verifiedRemovedRole')) {
+            try {
+              const role = this.discordServer.getSetting('verifiedRemovedRole')
+              if (!role || !this.discordServer.canManageRole(role)) return
+
+              await this.member.roles.add(role)
+            } catch (e) {}
+          }
+
+          let error = `:wave: You must be new! Please go to ${Util.getVerifyLink(this.discordServer.server)} and follow the instructions on the page in order to get verified.`
+
+          // Only trigger verification help message if this is a manually-invoked verification
+          if (options.message) {
+            if (VerificationAttempts.has(this.id) === false) {
+              VerificationAttempts.set(this.id, 0)
+            }
+
+            VerificationAttempts.set(this.id, VerificationAttempts.get(this.id) + 1)
+
+            if (VerificationAttempts.get(this.id) > 1) {
+              error =
+                stripIndents`:question: Looks like you are having trouble verifying your account! Here are some things you can try:
+
+                - Try visiting https://verify.eryn.io/ in an incognito / private browser window. (It's possible you are signed into the wrong Discord account in your browser)
+                - If you are using the profile code verification method, make sure that the code isn't getting filtered after you save it. If it is, try using the in-game method or generating a new code.
+                - Make sure you typed in the right Roblox username when trying to verify.`
+
+              VerificationAttempts.set(this.id, -5)
+            }
+          }
+
+          return status({
+            status: false,
+            error
+          })
+        } case 429:
+          // This client has exceeded the amount of requests allowed in a 60 second period.
+          return status({
+            status: false,
+            error: 'Server is busy. Please try again later.'
+          })
+        default:
+          // Something else is wrong.
+          return status({
+            status: false,
+            error: "Sorry, it looks like there's something wrong with the verification registry. Please try again later."
+          })
+      }
+    }
+  }
+}
+
+module.exports = DiscordMember
+
+/* global Cache */
+
+const path = require('path')
+const fs = require('mz/fs')
+const request = require('request-promise')
+const VirtualGroups = require('./VirtualGroups.js')
+const DiscordMember = require('./DiscordMember')
+const Util = require('./Util')
+
+// The default settings for DiscordServer.
+const DefaultSettings = {
+  verifiedRole: null,
+  verifiedRemovedRole: null,
+  nicknameUsers: true,
+  nicknameGroup: null,
+  joinDM: true,
+  verifyChannel: null,
+  announceChannel: null,
+  nicknameFormat: '%USERNAME%',
+  welcomeMessage: 'Welcome to %SERVER%, %USERNAME%!',
+  groupRankBindings: []
+}
+
+/**
+ * A DiscordServer class, it represents a guild that the bot is in.
+ * @class DiscordServer
+ */
+class DiscordServer {
+  /**
+   * Creates an instance of DiscordServer.
+   * @param {DiscordBot} discordBot The discord bot that the server belongs to.
+   * @param {Snowflake} id The guild id
+   */
+  constructor (discordBot, id) {
+    this.id = id
+    this.discordBot = discordBot
+    this.bot = this.discordBot.bot
+
+    this.server = this.bot.guilds.resolve(id)
+
+    this.verifyCooldowns = new Map()
+    this.nicknames = new Map()
+
+    this.ongoingBulkUpdate = false
+    this.bulkUpdateCount = 0
+
+    setInterval(() => {
+      this.verifyCooldowns = new Map()
+      this.nicknames = new Map()
+    }, 7200000)
+
+    // Load this server's settings.
+    this.settings = {}
+    this.areSettingsLoaded = false
+    this.ongoingSettingsUpdate = false
+    this.settingsPath = path.join(__dirname, 'data', `${id}.json`)
+
+    // We will load the settings in DiscordBot.getServer in order to know when
+    // the server is ready from the promise it returns.
+    // this.loadSettings();
+  }
+
+  isAuthorized () {
+    return !this.discordBot.isPremium() || this.discordBot.authorizedOwners.includes(this.server.ownerID)
+  }
+
+  /**
+   * This method loads the settings specific for this server.
+   * It also creates a settings file if there isn't one.
+   * @returns {undefined}
+   * @memberof DiscordServer
+   */
+  async loadSettings () {
+    // If there's no settings file for this server, create one.
+    if (!await fs.exists(this.settingsPath)) {
+      await fs.writeFile(this.settingsPath, JSON.stringify(DefaultSettings))
+    }
+
+    if (!await fs.exists(this.settingsPath)) {
+      throw new Error(`Couldn't write settings file: ${this.settingsPath}`)
+    }
+
+    // Load the settings file.
+    const fileData = await fs.readFile(this.settingsPath)
+
+    if (this.areSettingsLoaded) return
+
+    try {
+      this.settings = JSON.parse(fileData)
+      this.areSettingsLoaded = true
+    } catch (e) {
+      console.log(`${this.settingsPath} appears to be corrupted.`)
+    }
+
+    if (this.settings.commando != null && this.settings.commando.prefix != null) {
+      this.server._commandPrefix = this.settings.commando.prefix
+    }
+
+    this.cleanupRankBindings()
+  }
+
+  /**
+   * Clears the member cache for a specific Discord user.
+   * @static
+   * @param {Snowflake} id The Discord user id
+   * @memberof DiscordServer
+   */
+  static async clearMemberCache (id) {
+    await Cache.set('users', id, null)
+  }
+
+  /**
+   * Returns a setting value. Tries the saved settings, then tries
+   * the default settings.
+   * @param {string} key The setting key to get
+   * @returns {any} The setting value
+   * @memberof DiscordServer
+   */
+  getSetting (key) {
+    if (!this.areSettingsLoaded) {
+      throw new Error('Attempt to get a setting from a server whose settings are not loaded')
+    }
+
+    if (typeof this.settings[key] !== 'undefined') {
+      return this.settings[key]
+    } else if (typeof DefaultSettings[key] !== 'undefined') {
+      return DefaultSettings[key]
+    } else {
+      return null
+    }
+  }
+
+  /**
+   * Set a server setting and then save it to disk.
+   * @param {string} key The setting key to set
+   * @param {any} value The setting value to set
+   * @memberof DiscordServer
+   */
+  async setSetting (key, value) {
+    if (!this.areSettingsLoaded) {
+      throw new Error('Attempt to change a setting from a server whose settings are not loaded')
+    }
+    this.ongoingSettingsUpdate = true
+
+    this.settings[key] = value
+
+    const tmpSettingsPath = this.settingsPath + '.tmp'
+    await fs.writeFile(tmpSettingsPath, JSON.stringify(this.settings))
+
+    try {
+      JSON.parse(await fs.readFile(tmpSettingsPath, 'utf8')) // Throws if file got corrupted
+    } catch (e) {
+      this.ongoingSettingsUpdate = false
+      throw new Error('Atomic save failed: file corrupted. Try again.')
+    }
+
+    await fs.rename(tmpSettingsPath, this.settingsPath)
+    this.ongoingSettingsUpdate = false
+  }
+
+  /**
+   * Converts a group binding from the old format to the new format.
+   * @static
+   * @param {object} binding The binding to convert in the old format
+   * @returns {object} The binding in the new format
+   * @memberof DiscordServer
+   */
+  static convertOldBinding (binding) {
+    const newBinding = { role: binding.role }
+
+    const ranks = []
+    if (binding.operator === 'gt') {
+      for (let i = binding.rank; i <= 255; i++) {
+        ranks.push(i)
+      }
+    } else if (binding.operator === 'lt') {
+      for (let i = 1; i <= binding.rank; i++) {
+        ranks.push(i)
+      }
+    } else {
+      ranks.push(binding.rank)
+    }
+
+    newBinding.groups = [
+      {
+        id: binding.group,
+        ranks
+      }
+    ]
+
+    return newBinding
+  }
+
+  /**
+   * Fetches and caches a Roblox user's group information.
+   * @static
+   * @param {int} userid The roblox user id
+   * @returns {object} The group information
+   * @memberof DiscordServer
+   */
+  static async getRobloxMemberGroups (userid) {
+    let groups = await Cache.get(`bindings.${userid}`, '__groups')
+    if (!groups) {
+      groups = await request({
+        uri: `https://groups.roblox.com/v2/users/${userid}/groups/roles`,
+        json: true
+      })
+
+      if (!groups) {
+        throw new Error('Group rank HTTP request is malformed or in unknown format')
+      }
+
+      Cache.set(`bindings.${userid}`, '__groups', groups)
+    }
+
+    return groups.data
+  }
+
+  /**
+   * Checks if a group rank binding passes or fails for
+   * a specific Roblox user.
+   * @static
+   * @param {object} binding The group binding
+   * @param {int} userid The roblox user id
+   * @param {string} username The roblox username
+   * @returns {boolean} The group binding resolution
+   * @memberof DiscordServer
+   */
+  static async resolveGroupRankBinding (binding, userid, username) {
+    if (binding.group != null) {
+      binding = this.convertOldBinding(binding)
+    }
+
+    const bindingHash = Util.md5(JSON.stringify(binding))
+
+    // Check if the return value of this method has already been
+    // cached in memory. If so, return that.
+    const cachedBinding = await Cache.get(`bindings.${userid}`, bindingHash)
+    if (cachedBinding !== null) {
+      return cachedBinding
+    }
+
+    let returnValue = false
+
+    for (const group of binding.groups) {
+      if (VirtualGroups[group.id]) {
+        returnValue = await VirtualGroups[group.id]({ id: userid, username }, group.ranks[0], DiscordServer)
+
+        if (returnValue) break
+      } else {
+        // Check the rank of the user in the Roblox group.
+        const groups = await DiscordServer.getRobloxMemberGroups(userid)
+
+        let rank = 0
+        for (const groupObj of groups) {
+          if (groupObj.group.id.toString() === group.id) {
+            rank = groupObj.role.rank
+            break
+          }
+        }
+
+        returnValue = group.ranks.includes(rank)
+
+        if (returnValue) break
+      }
+    }
+
+    // Cache the return value in memory.
+    Cache.set(`bindings.${userid}`, bindingHash, returnValue)
+
+    return returnValue
+  }
+
+  /**
+   * Deletes a group rank binding associated with a role id.
+   * @param {Snowflake} roleid The role id to clear all bindings that are associated with it.
+   * @memberof DiscordServer
+   */
+  deleteGroupRankBinding (roleid) {
+    if (roleid === 'all') {
+      return this.setSetting('groupRankBindings', [])
+    }
+
+    const rankBindings = this.getSetting('groupRankBindings')
+
+    for (let i = 0; i < rankBindings.length; i++) {
+      const binding = rankBindings[i]
+
+      if (binding.role === roleid || roleid === 'all') {
+        rankBindings.splice(i, 1)
+      }
+    }
+
+    this.setSetting('groupRankBindings', rankBindings)
+  }
+
+  /**
+   * Deletes group bindings that are associated with Discord roles
+   * that have been deleted.
+   * @param {Channel} [noticeChannel] The channel to post the deletion notice to in a last resort if the owner is unreachable
+   * @memberof DiscordServer
+   */
+  async cleanupRankBindings (lastResortChannel) {
+    const verifiedRole = this.getSetting('verifiedRole')
+    const unverifiedRole = this.getSetting('verifiedRemovedRole')
+
+    if (verifiedRole && !await this.server.roles.fetch(verifiedRole)) {
+      this.setSetting('verifiedRole', null)
+      this.announce('Verified Role Deleted', 'Heads up! Looks like you (or someone) has deleted the verified role, so users will no longer get that when they verify.', { important: true, lastResortChannel })
+    }
+
+    if (unverifiedRole && !await this.server.roles.fetch(unverifiedRole)) {
+      this.setSetting('verifiedRemovedRole', null)
+      this.announce('Unverified Role Deleted', 'Heads up! Looks like you (or someone) has deleted the unverified role, so unverified users will no longer receive that role.', { important: true, lastResortChannel })
+    }
+
+    for (const binding of this.getSetting('groupRankBindings')) {
+      const id = binding.role
+      if (!await this.server.roles.fetch(id)) {
+        this.deleteGroupRankBinding(id)
+
+        this.announce('Bound Role Deleted', 'Heads up! Looks like you (or someone) has deleted a Discord role that was bound to ' + Util.getBindingText(binding, true), { important: true, lastResortChannel })
+      }
+    }
+  }
+
+  /**
+   * Posts an announcement in the server's configured announcement channel.
+   * If it's important, the server owner will be notified.
+   * @param {string} title The title of the embed message
+   * @param {string} text The body of the embed message
+   * @param {object} [options={}] Options for the announcement
+   * @param {boolean} options.important If this is an important announcement, the server owner will be mentioned or DM'd if no announce channel is set.
+   * @memberof DiscordServer
+   */
+  async announce (title, text, options = {}) {
+    const embed = {
+      color: options.important ? 0xe74c3c : 0x0064ba,
+      title,
+      description: text
+    }
+
+    if (this.getSetting('announceChannel')) {
+      const channel = await this.server.channels.cache.get(this.getSetting('announceChannel'))
+
+      if (channel) {
+        try {
+          await channel.send(options.important ? `${this.server.owner}` : '', { embed })
+          return
+        } catch (e) {}
+      }
+    }
+
+    if (options.important) {
+      try {
+        await this.server.owner.send(`An important notice was triggered in your server "${this.server.name}" and there is no announcement channel configured, so it has been sent to you here:`, { embed })
+        return
+      } catch (e) {}
+
+      if (this.server.systemChannel) {
+        try {
+          await this.server.systemChannel.send(`${this.server.owner} An important notice was triggered and there is no announcement channel configured and the server owner will not accept DMs from RoVer, so it has been posted here:`, { embed })
+          return
+        } catch (e) {}
+      }
+
+      if (options.lastResortChannel) {
+        try {
+          await options.lastResortChannel.send(`${this.server.owner} An important notice was triggered and there is no announcement channel configured and the server owner will not accept DMs from RoVer, so it has been posted here as a last resort:`, { embed })
+        } catch (e) {}
+      }
+    }
+  }
+
+  /**
+   * Gets this server's specific welcome message, or the default
+   * one if none is configured.
+   * @param {object} data String replacement data
+   * @returns {string} The processed string
+   * @memberof DiscordServer
+   */
+  getWelcomeMessage (data, member) {
+    if (this.hasCustomWelcomeMessage()) {
+      return Util.formatDataString(`You joined ${this.server.name}! Here's a message from the server owners: ${this.getSetting('welcomeMessage')}`, data, member)
+    } else {
+      return Util.formatDataString(this.getSetting('welcomeMessage'), data, member)
+    }
+  }
+
+  /**
+   * Checks to see if this server has configured a custom welcome message.
+   * @returns {boolean} True if this server has a custom welcome message
+   * @memberof DiscordServer
+   */
+  hasCustomWelcomeMessage () {
+    return DefaultSettings.welcomeMessage !== this.getSetting('welcomeMessage')
+  }
+
+  /**
+   * Returns a DiscordMember belonging to this DiscordServer.
+   * @param {Snowflake} id The id of the user
+   * @returns {Promise<DiscordMember>} The new discord member
+   * @memberof DiscordServer
+   */
+  async getMember (id) {
+    return DiscordMember.new(this, id)
+  }
+
+  /**
+   * Returns whether or not a role is in use by the verified, not verified, or binding roles
+   *
+   * @param {Snowflake} id The role id
+   * @returns {boolean} True if the role is in use
+   * @memberof DiscordServer
+   */
+  isRoleInUse (id) {
+    if (this.getSetting('verifiedRole') === id) return true
+    if (this.getSetting('verifiedRemovedRole') === id) return true
+
+    for (const binding of this.getSetting('groupRankBindings')) {
+      if (binding.role === id) return true
+    }
+
+    return false
+  }
+
+  canManageRole (roleResolvable) {
+    if (!this.server.me.hasPermission('MANAGE_ROLES')) return false
+
+    const role = this.server.roles.cache.get(roleResolvable)
+
+    if (!role) return false
+
+    return this.server.me.roles.highest.comparePositionTo(role) > 0
+  }
+}
+
+module.exports = DiscordServer
+
+const Discord = require('discord.js')
+const cacheTTLs = {
+  blacklists: Infinity,
+  bindings: 120000,
+  groups: 360000,
+  users: 45000
+}
+
+/**
+ * The GlobalCache is a singleton that holds an in-memory cache that will hold information
+ * from the sub-processes (shards). It is done on the master process so as to not fragment
+ * the caches between the shards.
+ * @class GlobalCache
+ */
+class GlobalCache {
+  /**
+   * Creates an instance of GlobalCache.
+   * @param {Discord.ShardingManager} shardingManager The Discord.js sharding manager
+   */
+  constructor (shardingManager) {
+    this.shardingManager = shardingManager
+    this.collections = {}
+
+    shardingManager.on('shardCreate', shard => shard.on('message', this.onMessage.bind(this, shard)))
+    shardingManager.shards.forEach(shard => shard.on('message', this.onMessage.bind(this, shard)))
+
+    setInterval(() => {
+      Object.keys(this.collections).forEach(col => {
+        const ttl = this.getTTL(col)
+        if (this.collections[col].created + ttl <= Date.now()) {
+          delete this.collections[col]
+        }
+      })
+    }, 60000)
+  }
+  /**
+   * Fires when a message from a child shard is sent
+   * @listens ShardingManager#message
+   * @param {Shard} shard The shard that sent the message
+   * @param {object} message The message that was sent
+   * @memberof GlobalCache
+   */
+  onMessage (shard, message) {
+    switch (message.action) {
+      case 'get':
+        this.get(shard, message)
+        break
+      case 'set':
+        this.set(shard, message)
+        break
+      case 'clear':
+        this.clear(shard, message)
+        break
+    }
+  }
+
+  /**
+   * Returns the collection  requested
+   * @param {string} name The collection name
+   * @returns {object} The collection
+   * @memberof GlobalCache
+   */
+  getCollection (name) {
+    if (typeof this.collections[name] === 'undefined') {
+      this.collections[name] = {}
+    }
+    return this.collections[name]
+  }
+
+  getTTL (name) {
+    const abbrevName = name.replace(/\.\d*/, '')
+    return cacheTTLs[abbrevName] || 60000
+  }
+
+  /**
+   * Reads a message from a shard and replies with the requested value
+   * @param {Shard} shard The shard that sent the message
+   * @param {object} message The message sent
+   * @memberof GlobalCache
+   */
+  get (shard, message) {
+    const collection = this.getCollection(message.collection)
+
+    shard.send({
+      action: 'getReply',
+      id: message.id,
+      collection: message.collection,
+      key: message.key,
+      // 'undefined' is not a valid json type (won't persist through serialization)
+      value: typeof collection[message.key] === 'undefined' ? null : collection[message.key]
+    })
+  }
+
+  /**
+   * Handles a clear request from a shard
+   * @param {Shard} shard The shard that sent the message
+   * @param {object} message The message sent
+   * @memberof GlobalCache
+   */
+  clear (shard, message) {
+    this.collections[message.collection] = {}
+
+    shard.send({
+      action: 'clearReply',
+      id: message.id,
+      collection: message.collection,
+      value: true
+    })
+  }
+
+  /**
+   * Handles a set request from a shard
+   * @param {Shard} shard The shard that sent the message
+   * @param {object} message The message sent
+   * @memberof GlobalCache
+   */
+  set (shard, message) {
+    const collection = this.getCollection(message.collection)
+    collection[message.key] = message.value
+    if (!collection.created) collection.created = Date.now()
+
+    shard.send({
+      action: 'setReply',
+      id: message.id,
+      collection: message.collection,
+      key: message.key
+    })
+  }
+}
+
+/**
+ * The Cache class is the connector between the GlobalCache on the main process and the shards.
+ * @class Cache
+ */
+class Cache {
+  /**
+   * Creates an instance of Cache.
+   * @param {Discord.Client} client The client this cache belongs to
+   */
+  constructor (client) {
+    this.client = client
+    this.shardClientUtil = Discord.ShardClientUtil.singleton(this.client)
+    this.index = -1
+    this.promises = {}
+
+    process.on('message', this.onMessage.bind(this))
+  }
+
+  /**
+   * Returns a unique id
+   * @returns {int} The new id
+   * @memberof Cache
+   */
+  getNextIndex () {
+    this.index++
+    return this.index
+  }
+
+  /**
+   * Called when a new message comes in from the master process
+   * Resolves all promises related to the message id
+   * @param {object} msg The new message
+   * @returns {undefined}
+   * @memberof Cache
+   */
+  onMessage (msg) {
+    if (typeof msg.id === 'undefined' || !this.promises[msg.id]) {
+      return
+    }
+
+    // Resolve the promise with the value
+    this.promises[msg.id](msg.value)
+  }
+
+  /**
+   * Gets a value from the global cache
+   * @param {string} collection The collection (namespace) which this key belongs to
+   * @param {string} key The key you want to get
+   * @returns {Promise<any>} The value associated with the key
+   * @memberof Cache
+   */
+  get (collection, key) {
+    const id = this.getNextIndex()
+
+    this.shardClientUtil.send({
+      action: 'get',
+      collection,
+      key,
+      id
+    })
+
+    return new Promise(resolve => {
+      this.promises[id] = resolve
+    })
+  }
+
+  // Returns Promise<true>
+  /**
+   * Clears a collection (namespace) entirely, useful for resetting a user cache
+   * @param {string} collection The collection to clear
+   * @returns {Promise<true>} Resolves when the clear is completed.
+   * @memberof Cache
+   */
+  clear (collection) {
+    const id = this.getNextIndex()
+
+    this.shardClientUtil.send({
+      action: 'clear',
+      collection,
+      id
+    })
+
+    return new Promise(resolve => {
+      this.promises[id] = resolve
+    })
+  }
+
+  // Returns Promise<Value>
+  /**
+   * Sets a value in the global cache.
+   * @param {string} collection The collection (namespace) which this key belongs to
+   * @param {string} key The key you want to get
+   * @param {any} value The value you want to set
+   * @returns {Promise<any>} Returns the value when it is set
+   * @memberof Cache
+   */
+  set (collection, key, value) {
+    const id = this.getNextIndex()
+
+    this.shardClientUtil.send({
+      action: 'set',
+      collection,
+      key,
+      value,
+      id
+    })
+
+    return new Promise(resolve => {
+      this.promises[id] = resolve
+    })
+  }
+}
+
+module.exports = { GlobalCache, Cache }
